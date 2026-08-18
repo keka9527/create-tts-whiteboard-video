@@ -1,0 +1,64 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local models and caches
+models/
+checkpoints/
+weights/
+cache/
+.cache/
+*.ckpt
+*.pth
+*.pt
+*.onnx
+*.bin
+
+# Generated media and project data
+out/
+output/
+build/
+dist/
+tmp/
+temp/
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.gif
+*.wav
+*.mp3
+*.m4a
+*.aac
+*.srt
+*.ass
+*.ssa
+
+# Generated manifests and reports
+tts-segments.json
+render-manifest.json
+timing-report.json
+validation-report.json
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
