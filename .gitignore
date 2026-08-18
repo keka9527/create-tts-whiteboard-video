@@ -38,10 +38,12 @@ dist/
 tmp/
 temp/
 *.mp4
+!demo/whiteboard-demo.mp4
 *.mov
 *.mkv
 *.avi
 *.gif
+!demo/preview.gif
 *.wav
 *.mp3
 *.m4a
