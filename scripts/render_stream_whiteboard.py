@@ -3,9 +3,11 @@
 SRT 白板动画 - 整合渲染器（mask 编排 + stream 画法）
 
 把一张线稿图 + 同名 annotation.json 渲染成白板手绘动画：
-  - 编排沿用 whiteboard-mask-animation：按 sequence/startMs 顺序逐区域揭示，
-    每个区域的可作画范围 = 矩形 region 扣除「后续区域 + protectedRegions」，
-    未开始的区域因掩码限制不会提前露线（mask 的核心不变量）。
+  - spatial-scan（项目默认）：从左侧向右推进，每个竖向带内由上到下，
+    线稿在前、颜色短暂滞后跟随，不再按矩形标注跳着揭示。
+  - semantic（兼容模式）：按 sequence/startMs 顺序逐区域揭示。
+    所有重叠像素先经过唯一归属计算；protectedRegions 只改变归属，不再把
+    像素丢进无人绘制的遮罩死区。未开始区域仍不会提前露线。
   - 画法换成 whiteboard-stream-animation：每个区域在自己的允许掩码内，
     沿骨架/网格笔迹连续落墨（起笔 ink → 添彩 color），笔尖跟随真实笔迹，
     所有区域共享同一张持久画布，已画完的区域保留在画布上。
@@ -69,7 +71,8 @@ class RegionStreamRenderer:
     """持有整段渲染的共享状态；逐区域把 stream 笔迹画进同一张画布。"""
 
     def __init__(self, image_bgr: np.ndarray, annotation: dict, cfg: sr.Config,
-                 hand_png: Path | None, bare_tip: bool) -> None:
+                 hand_png: Path | None, bare_tip: bool,
+                 tip_smoothing: float = 0.30) -> None:
         self.cfg = cfg
         self.ann = annotation
         self.canvas_bgr = sr._hex_to_bgr(cfg.canvas_hex)
@@ -88,6 +91,16 @@ class RegionStreamRenderer:
         self.sx = self.out_w / cw
         self.sy = self.out_h / ch
 
+        self.elements = sorted(
+            self.ann["elements"],
+            key=lambda e: (e["reveal"]["startMs"], e.get("sequence", 0)),
+        )
+        (
+            self.allowed_masks,
+            self.mask_report,
+            self._legacy_dead_mask,
+        ) = self._build_exclusive_owner_masks(self.elements)
+
         self.color_img = cv2.resize(image_bgr, (self.out_w, self.out_h), interpolation=cv2.INTER_AREA)
         gray = cv2.cvtColor(self.color_img, cv2.COLOR_BGR2GRAY)
         self.thresh_map = cv2.adaptiveThreshold(
@@ -101,6 +114,12 @@ class RegionStreamRenderer:
         # 背景染成画布底色，让上色阶段背景与起笔一致（不碰墨迹）
         if cfg.match_bg:
             self._match_original_background()
+        color_diff = np.abs(
+            self.color_img.astype(np.int16) - self.canvas_bgr.astype(np.int16)
+        ).sum(axis=2)
+        # 背景已被归一到 canvas 色；只把真实线条/颜色加入全局描画路径，
+        # 避免矩形背景边缘或“浮在空中的道路横条”。
+        self.foreground_pixels = (color_diff >= 8) | self.ink_pixels
 
         # 共享持久画布
         self.drawn = np.empty((self.out_h, self.out_w, 3), dtype=np.float32)
@@ -108,6 +127,8 @@ class RegionStreamRenderer:
 
         # 笔尖覆盖
         self.tip: sr.TipOverlay | None = None
+        self.tip_smoothing = float(np.clip(tip_smoothing, 0.01, 1.0))
+        self._tip_position: tuple[float, float] | None = None
         if not bare_tip:
             hand_data = sr._load_hand(hand_png, cfg.target_hand_height) if hand_png else None
             ax, ay = cfg.tip_anchor_x, cfg.tip_anchor_y
@@ -135,21 +156,139 @@ class RegionStreamRenderer:
     def _snapshot_with_tip(self, px: int, py: int) -> np.ndarray:
         snap = self.drawn.astype(np.uint8)
         if self.tip is not None:
-            self.tip.stamp(snap, px, py)
+            if self._tip_position is None:
+                smooth_x, smooth_y = float(px), float(py)
+            else:
+                old_x, old_y = self._tip_position
+                alpha = self.tip_smoothing
+                smooth_x = old_x + alpha * (float(px) - old_x)
+                smooth_y = old_y + alpha * (float(py) - old_y)
+            self._tip_position = (smooth_x, smooth_y)
+            self.tip.stamp(snap, int(round(smooth_x)), int(round(smooth_y)))
         return snap
 
-    # ── 单区域的允许掩码：矩形 - 后续区域 - protectedRegions ──
-    def _allowed_mask(self, element: dict, later_elements: list[dict]) -> np.ndarray:
+    def _rect_mask(self, region: dict) -> np.ndarray:
         mask = np.zeros((self.out_h, self.out_w), dtype=bool)
-        x0, y0, x1, y1 = _scaled_rect(element["region"], self.sx, self.sy, self.out_w, self.out_h)
+        x0, y0, x1, y1 = _scaled_rect(region, self.sx, self.sy, self.out_w, self.out_h)
         mask[y0:y1, x0:x1] = True
-        for later in later_elements:
-            lx0, ly0, lx1, ly1 = _scaled_rect(later["region"], self.sx, self.sy, self.out_w, self.out_h)
-            mask[ly0:ly1, lx0:lx1] = False
+        return mask
+
+    def _protected_mask(self, element: dict) -> np.ndarray:
+        mask = np.zeros((self.out_h, self.out_w), dtype=bool)
         for prot in element.get("reveal", {}).get("protectedRegions", []):
             px0, py0, px1, py1 = _scaled_rect(prot, self.sx, self.sy, self.out_w, self.out_h)
-            mask[py0:py1, px0:px1] = False
+            mask[py0:py1, px0:px1] = True
         return mask
+
+    @staticmethod
+    def _component_boxes(mask: np.ndarray, limit: int = 20) -> tuple[int, list[dict]]:
+        count, _, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+        components = []
+        for idx in range(1, count):
+            x, y, width, height, pixels = [int(v) for v in stats[idx]]
+            components.append(
+                {"x": x, "y": y, "width": width, "height": height, "pixels": pixels}
+            )
+        components.sort(key=lambda item: item["pixels"], reverse=True)
+        return len(components), components[:limit]
+
+    def _build_exclusive_owner_masks(
+        self, elements: list[dict]
+    ) -> tuple[list[np.ndarray], dict, np.ndarray]:
+        """Assign every pixel in the annotated union to exactly one element.
+
+        Later regions own overlaps by default, preserving delayed reveal. A
+        protected region makes the current element ineligible only where another
+        annotated element can own that pixel. This also recovers old annotations
+        that put an earlier subject in a later element's protectedRegions: those
+        pixels return to the earlier subject instead of becoming a dead zone.
+        """
+        regions = [self._rect_mask(element["region"]) for element in elements]
+        protected = [self._protected_mask(element) for element in elements]
+        region_stack = np.stack(regions, axis=0)
+        claimant_count = region_stack.sum(axis=0, dtype=np.uint16)
+        region_union = claimant_count > 0
+
+        # Reproduce the legacy policy for diagnostics only.
+        legacy_masks: list[np.ndarray] = []
+        later_union = np.zeros_like(region_union)
+        for idx in range(len(elements) - 1, -1, -1):
+            legacy = regions[idx] & ~later_union & ~protected[idx]
+            legacy_masks.append(legacy)
+            later_union |= regions[idx]
+        legacy_masks.reverse()
+        legacy_union = np.logical_or.reduce(legacy_masks)
+        legacy_dead = region_union & ~legacy_union
+
+        # protectedRegions may transfer ownership, but may never erase the last
+        # remaining claimant for a pixel.
+        eligible_masks: list[np.ndarray] = []
+        redirected_pixels = []
+        for idx, region in enumerate(regions):
+            has_other_claimant = (claimant_count - region.astype(np.uint16)) > 0
+            redirected = region & protected[idx] & has_other_claimant
+            eligible_masks.append(region & ~redirected)
+            redirected_pixels.append(int(np.count_nonzero(redirected)))
+
+        owner = np.full((self.out_h, self.out_w), -1, dtype=np.int16)
+        for idx, eligible in enumerate(eligible_masks):
+            owner[eligible] = idx  # later eligible elements win overlaps
+
+        # If annotations mutually protect the same overlap, retain deterministic
+        # later-element ownership instead of allowing a visible rectangular hole.
+        fallback = region_union & (owner < 0)
+        fallback_pixels = int(np.count_nonzero(fallback))
+        if fallback_pixels:
+            for idx, region in enumerate(regions):
+                owner[fallback & region] = idx
+
+        allowed_masks = [owner == idx for idx in range(len(elements))]
+        coverage_gap = region_union & (owner < 0)
+        legacy_component_count, legacy_components = self._component_boxes(legacy_dead)
+        report = {
+            "policy": "exclusive-owner-v2",
+            "canvas": {"width": self.out_w, "height": self.out_h},
+            "elementCount": len(elements),
+            "annotatedUnionPixels": int(np.count_nonzero(region_union)),
+            "legacyDeadZonePixels": int(np.count_nonzero(legacy_dead)),
+            "legacyDeadZoneComponentCount": legacy_component_count,
+            "legacyDeadZones": legacy_components,
+            "mutualProtectionFallbackPixels": fallback_pixels,
+            "coverageGapPixels": int(np.count_nonzero(coverage_gap)),
+            "elements": [
+                {
+                    "id": element.get("id", f"element-{idx + 1}"),
+                    "ownedPixels": int(np.count_nonzero(allowed_masks[idx])),
+                    "protectedPixelsReassigned": redirected_pixels[idx],
+                }
+                for idx, element in enumerate(elements)
+            ],
+        }
+        return allowed_masks, report, legacy_dead
+
+    def write_mask_diagnostics(self, report_path: Path | None, preview_path: Path | None) -> None:
+        if report_path is not None:
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(
+                json.dumps(self.mask_report, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        if preview_path is not None:
+            preview_path.parent.mkdir(parents=True, exist_ok=True)
+            preview = self.color_img.copy()
+            preview[self._legacy_dead_mask] = (40, 40, 235)
+            for box in self.mask_report["legacyDeadZones"]:
+                cv2.rectangle(
+                    preview,
+                    (box["x"], box["y"]),
+                    (box["x"] + box["width"], box["y"] + box["height"]),
+                    (0, 0, 255),
+                    3,
+                )
+            ok, encoded = cv2.imencode(".png", preview)
+            if not ok:
+                raise RuntimeError(f"无法编码遮罩诊断图: {preview_path}")
+            encoded.tofile(str(preview_path))
 
     # ── 区域内笔迹路径 ──
     def _region_grid_path(self, allowed: np.ndarray) -> list[tuple[int, int]]:
@@ -200,6 +339,36 @@ class RegionStreamRenderer:
         paint = np.repeat(block[:, :, None], 3, axis=2)
         target = self.drawn[r * e:r * e + e, c * e:c * e + e]
         target[ink_region] = paint[ink_region]
+
+    def _color_stamp_cell(self, cell: tuple[int, int], allowed: np.ndarray) -> None:
+        r, c = cell
+        e = self.cfg.grid_edge
+        y0, y1 = r * e, r * e + e
+        x0, x1 = c * e, c * e + e
+        reveal = allowed[y0:y1, x0:x1]
+        target = self.drawn[y0:y1, x0:x1]
+        source = self.color_img[y0:y1, x0:x1].astype(np.float32)
+        target[reveal] = source[reveal]
+
+    def _spatial_scan_path(self, band_px: int) -> list[tuple[int, int]]:
+        """Return a continuous diagonal frontier: left first, upper pixels slightly ahead."""
+        edge = self.cfg.grid_edge
+        blocks = sr._to_grid_blocks(self.foreground_pixels.astype(np.uint8), edge)
+        active = blocks.any(axis=(2, 3))
+        rows, cols = active.shape
+        cells = [(row, col) for row in range(rows) for col in range(cols) if active[row, col]]
+        # A bottom pixel trails the top by roughly band_px. Unlike discrete
+        # vertical bands, this never jumps back to the top or creates a hard
+        # horizontal strip at each band boundary.
+        vertical_slope = max(0.0, float(band_px)) / max(1.0, float(self.out_h))
+        cells.sort(
+            key=lambda cell: (
+                cell[1] * edge + cell[0] * edge * vertical_slope,
+                cell[1],
+                cell[0],
+            )
+        )
+        return cells
 
     def _color_stamp(self, px: int, py: int, disk: np.ndarray, allowed: np.ndarray) -> None:
         radius = self.cfg.brush_radius
@@ -350,9 +519,26 @@ class RegionStreamRenderer:
         return samples, pen_lifts, sample_cell
 
     # ── 主渲染 ──
-    def render_to(self, raw_path: Path, total_ms: int) -> Path:
+    def render_to(
+        self,
+        raw_path: Path,
+        total_ms: int,
+        reveal_order: str = "semantic",
+        spatial_band_px: int = 180,
+        spatial_color_lag_ms: int = 320,
+    ) -> Path:
+        if reveal_order == "spatial-scan":
+            return self._render_spatial_scan_to(
+                raw_path,
+                total_ms,
+                band_px=spatial_band_px,
+                color_lag_ms=spatial_color_lag_ms,
+            )
+        return self._render_semantic_to(raw_path, total_ms)
+
+    def _render_semantic_to(self, raw_path: Path, total_ms: int) -> Path:
         cfg = self.cfg
-        elements = sorted(self.ann["elements"], key=lambda e: e["reveal"]["startMs"])
+        elements = self.elements
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(str(raw_path), fourcc, cfg.fps, (self.out_w, self.out_h))
         if not writer.isOpened():
@@ -379,7 +565,7 @@ class RegionStreamRenderer:
                 dur_ms = reveal["durationMs"]
                 fill_static(start_ms)
 
-                allowed = self._allowed_mask(element, elements[idx + 1:])
+                allowed = self.allowed_masks[idx]
                 ink_frames = max(1, round(dur_ms * cfg.ink_weight / weight_sum * cfg.fps / 1000))
                 color_frames = max(1, round(dur_ms * cfg.color_weight / weight_sum * cfg.fps / 1000))
 
@@ -422,6 +608,78 @@ class RegionStreamRenderer:
             # 最终帧显示完整原图（凝视）
             self.drawn[...] = self.color_img.astype(np.float32)
             fill_static(gaze_until)
+        finally:
+            writer.release()
+        return raw_path
+
+    def _render_spatial_scan_to(
+        self, raw_path: Path, total_ms: int, band_px: int, color_lag_ms: int
+    ) -> Path:
+        """Render one continuous whole-scene scan on the TTS-derived time span."""
+        cfg = self.cfg
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(raw_path), fourcc, cfg.fps, (self.out_w, self.out_h))
+        if not writer.isOpened():
+            raise RuntimeError("无法打开视频写入器")
+
+        path = self._spatial_scan_path(band_px)
+        if not path:
+            writer.release()
+            raise RuntimeError("整图连续描画没有检测到可绘制前景")
+
+        draw_start_ms = min(element["reveal"]["startMs"] for element in self.elements)
+        draw_end_ms = max(
+            element["reveal"]["startMs"] + element["reveal"]["durationMs"]
+            for element in self.elements
+        )
+        draw_end_ms = min(float(total_ms), float(draw_end_ms))
+        start_frames = max(0, int(round(draw_start_ms * cfg.fps / 1000.0)))
+        draw_frames = max(2, int(round((draw_end_ms - draw_start_ms) * cfg.fps / 1000.0)))
+        total_frames = max(start_frames + draw_frames, int(round(total_ms * cfg.fps / 1000.0)))
+        lag_frames = int(round(color_lag_ms * cfg.fps / 1000.0))
+        lag_frames = max(1, min(draw_frames // 3, lag_frames))
+        ink_frames = max(1, draw_frames - lag_frames)
+        color_frames = max(1, draw_frames - lag_frames)
+        ink_targets = _frame_progress_indices(len(path), ink_frames)
+        color_targets = _frame_progress_indices(len(path), color_frames)
+        ink_done = 0
+        color_done = 0
+        current_cell = path[0]
+
+        try:
+            blank = self.drawn.astype(np.uint8)
+            for _ in range(start_frames):
+                writer.write(blank)
+
+            for frame_idx in range(draw_frames):
+                if frame_idx < ink_frames:
+                    ink_target = ink_targets[frame_idx]
+                    while ink_done <= ink_target and ink_done < len(path):
+                        current_cell = path[ink_done]
+                        self._ink_stamp_cell(current_cell, self.foreground_pixels)
+                        ink_done += 1
+
+                color_idx = frame_idx - lag_frames
+                if color_idx >= 0:
+                    color_target = color_targets[min(color_idx, color_frames - 1)]
+                    while color_done <= color_target and color_done < len(path):
+                        self._color_stamp_cell(path[color_done], self.foreground_pixels)
+                        color_done += 1
+
+                px, py = self._cell_center(current_cell)
+                writer.write(self._snapshot_with_tip(px, py))
+
+            while ink_done < len(path):
+                self._ink_stamp_cell(path[ink_done], self.foreground_pixels)
+                ink_done += 1
+            while color_done < len(path):
+                self._color_stamp_cell(path[color_done], self.foreground_pixels)
+                color_done += 1
+
+            final = self.drawn.astype(np.uint8)
+            written = start_frames + draw_frames
+            for _ in range(max(0, total_frames - written)):
+                writer.write(final)
         finally:
             writer.release()
         return raw_path
@@ -481,6 +739,14 @@ def _parse_args(argv=None):
     p.add_argument("hand", nargs="?", default=str(DEFAULT_HAND), help="手部素材 PNG（默认内置）")
     p.add_argument("--total-ms", type=int, default=None, help="总时长；缺省用标注 sceneDurationMs")
     p.add_argument("--bare-tip", action="store_true", help="不叠加笔尖/手部")
+    p.add_argument("--hand-height", type=int, default=260,
+                   help="手部素材缩放后的高度（内部画布像素，默认 260）")
+    p.add_argument("--tip-anchor-x", type=float, default=0.0,
+                   help="笔尖在手部透明图中的归一化 X 锚点，默认 0.0")
+    p.add_argument("--tip-anchor-y", type=float, default=0.0,
+                   help="笔尖在手部透明图中的归一化 Y 锚点，默认 0.0")
+    p.add_argument("--tip-smoothing", type=float, default=0.30,
+                   help="手部跟随平滑系数 0-1；越小越稳，默认 0.30")
     p.add_argument("--ink-path", default="grid", choices=["grid", "skeleton"],
                    help="笔迹路径: grid 网格(默认); skeleton 骨架追踪")
     p.add_argument("--color-fill", default="contour-wipe", choices=["contour-wipe", "brush"],
@@ -494,6 +760,16 @@ def _parse_args(argv=None):
     p.add_argument("--brush-radius", type=int, default=None)
     p.add_argument("--cap-long-edge", type=int, default=None,
                    help="输出长边像素上限（预览可调小加速，默认 1080）")
+    p.add_argument("--mask-report", type=Path, default=None,
+                   help="输出遮罩归属与旧版死区诊断 JSON")
+    p.add_argument("--mask-preview", type=Path, default=None,
+                   help="输出旧版死区红色标记预览图")
+    p.add_argument("--reveal-order", default="semantic", choices=["semantic", "spatial-scan"],
+                   help="semantic 按主体逐个完成描线和上色（默认）；spatial-scan 从左到右连续描画整图")
+    p.add_argument("--spatial-band-px", type=int, default=180,
+                   help="spatial-scan 中画面底部相对顶部的水平滞后距离")
+    p.add_argument("--spatial-color-lag-ms", type=int, default=320,
+                   help="spatial-scan 中颜色落后线稿的毫秒数")
     return p.parse_args(argv)
 
 
@@ -508,6 +784,9 @@ def _build_cfg(args) -> sr.Config:
         kw["brush_radius"] = args.brush_radius
     if args.cap_long_edge is not None:
         kw["cap_long_edge"] = args.cap_long_edge
+    kw["target_hand_height"] = max(32, args.hand_height)
+    kw["tip_anchor_x"] = float(np.clip(args.tip_anchor_x, 0.0, 1.0))
+    kw["tip_anchor_y"] = float(np.clip(args.tip_anchor_y, 0.0, 1.0))
     kw["ink_path_mode"] = args.ink_path
     kw["color_fill"] = args.color_fill
     kw["pause_mode"] = args.pause
@@ -545,13 +824,37 @@ def main(argv=None) -> int:
     raw_path = out_path.with_name(out_path.stem + "_raw.mp4")
 
     hand_png = Path(args.hand) if args.hand else None
-    renderer = RegionStreamRenderer(image_bgr, annotation, cfg, hand_png, args.bare_tip)
+    renderer = RegionStreamRenderer(
+        image_bgr,
+        annotation,
+        cfg,
+        hand_png,
+        args.bare_tip,
+        tip_smoothing=args.tip_smoothing,
+    )
     print(f"  输入: {args.image}")
     print(f"  输出尺寸: {renderer.out_w}x{renderer.out_h}, 帧率: {cfg.fps}")
     print(f"  区域数: {len(annotation['elements'])}, 总时长: {total_ms}ms, "
-          f"笔迹: {cfg.ink_path_mode}, 上色: {cfg.color_fill}")
+          f"笔迹: {cfg.ink_path_mode}, 上色: {cfg.color_fill}, 顺序: {args.reveal_order}")
+    if args.bare_tip:
+        print("  手部动画: 关闭")
+    else:
+        print(f"  手部动画: 开启, 高度: {cfg.target_hand_height}px, "
+              f"平滑系数: {float(np.clip(args.tip_smoothing, 0.01, 1.0)):.2f}")
+    renderer.write_mask_diagnostics(args.mask_report, args.mask_preview)
+    print(f"  遮罩策略: {renderer.mask_report['policy']}, "
+          f"旧版死区像素: {renderer.mask_report['legacyDeadZonePixels']}, "
+          f"新版覆盖缺口: {renderer.mask_report['coverageGapPixels']}")
+    if renderer.mask_report["coverageGapPixels"] != 0:
+        raise RuntimeError("遮罩唯一归属失败：仍存在无人负责的像素")
 
-    renderer.render_to(raw_path, total_ms)
+    renderer.render_to(
+        raw_path,
+        total_ms,
+        reveal_order=args.reveal_order,
+        spatial_band_px=args.spatial_band_px,
+        spatial_color_lag_ms=args.spatial_color_lag_ms,
+    )
     final = sr.transcode_h264(raw_path, out_path)
 
     size_mb = final.stat().st_size / (1024 * 1024)

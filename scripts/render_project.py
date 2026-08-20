@@ -79,6 +79,26 @@ def main() -> int:
     parser.add_argument("--renderer-python", type=Path, default=None)
     parser.add_argument("--subtitle-font", default="Microsoft YaHei")
     parser.add_argument("--subtitle-size", type=int, default=16)
+    parser.add_argument(
+        "--reveal-order",
+        choices=["semantic", "spatial-scan"],
+        default="semantic",
+        help=(
+            "Semantic subject-by-subject drawing is the default; "
+            "spatial-scan keeps the optional whole-scene left-to-right sweep."
+        ),
+    )
+    parser.add_argument("--spatial-band-px", type=int, default=180)
+    parser.add_argument("--spatial-color-lag-ms", type=int, default=320)
+    parser.add_argument("--hide-hand", action="store_true", help="关闭默认的手持画笔动画")
+    parser.add_argument(
+        "--hand",
+        type=Path,
+        default=SCRIPT_DIR.parent / "assets" / "drawing-hand.png",
+        help="带透明通道的手部 PNG；默认使用 Skill 内置通用素材",
+    )
+    parser.add_argument("--hand-height", type=int, default=260)
+    parser.add_argument("--tip-smoothing", type=float, default=0.30)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
@@ -92,6 +112,8 @@ def main() -> int:
         raise ValueError(f"No timed annotations found in {args.timed_assets}")
     if not args.audio.exists() or not args.srt.exists():
         raise FileNotFoundError("Audio or SRT input is missing")
+    if not args.hide_hand and not args.hand.exists():
+        raise FileNotFoundError(f"Hand PNG is missing: {args.hand}")
 
     scene_dir = args.work_dir / "rendered-scenes-tts-master"
     scene_dir.mkdir(parents=True, exist_ok=True)
@@ -105,13 +127,19 @@ def main() -> int:
             previous = {}
 
     settings = {
+        "maskPolicy": "exclusive-owner-v2",
+        "revealOrder": args.reveal_order,
+        "spatialBandPx": args.spatial_band_px,
+        "spatialColorLagMs": args.spatial_color_lag_ms,
         "fps": 60,
         "gridEdge": 5,
         "motionProfile": "smooth",
         "inkPath": "grid",
         "colorFill": "contour-wipe",
         "pause": "off",
-        "bareTip": True,
+        "handVisible": not args.hide_hand,
+        "handHeight": max(32, args.hand_height),
+        "tipSmoothing": min(1.0, max(0.01, args.tip_smoothing)),
     }
     scene_outputs = []
     manifest = {}
@@ -119,24 +147,39 @@ def main() -> int:
         image = scene_image(annotation)
         base = annotation.name[: -len(".annotation.json")]
         output = scene_dir / f"{base}-whiteboard.mp4"
-        signature = digest_files([annotation, image], settings)
+        mask_report = scene_dir / f"{base}-mask-report.json"
+        mask_preview = scene_dir / f"{base}-legacy-dead-zone-preview.png"
+        signature_paths = [annotation, image, renderer, SCRIPT_DIR / "stream_render.py"]
+        if not args.hide_hand:
+            signature_paths.append(args.hand)
+        signature = digest_files(signature_paths, settings)
+        mask_report_ok = False
+        if mask_report.exists() and mask_preview.exists():
+            try:
+                report_data = json.loads(mask_report.read_text(encoding="utf-8"))
+                mask_report_ok = (
+                    report_data.get("policy") == settings["maskPolicy"]
+                    and report_data.get("coverageGapPixels") == 0
+                )
+            except (OSError, ValueError):
+                mask_report_ok = False
         cached = (
             not args.force
             and output.exists()
             and output.stat().st_size > 1024
+            and mask_report_ok
             and previous.get(base, {}).get("signature") == signature
         )
         if cached:
             print(f"CACHE_SCENE={output.resolve()}")
         else:
-            run_checked(
+            command = [str(py), str(renderer), str(image), str(annotation), str(output)]
+            if args.hide_hand:
+                command.append("--bare-tip")
+            else:
+                command.append(str(args.hand))
+            command.extend(
                 [
-                    str(py),
-                    str(renderer),
-                    str(image),
-                    str(annotation),
-                    str(output),
-                    "--bare-tip",
                     "--ink-path",
                     "grid",
                     "--color-fill",
@@ -149,8 +192,23 @@ def main() -> int:
                     "5",
                     "--motion-profile",
                     "smooth",
+                    "--reveal-order",
+                    args.reveal_order,
+                    "--spatial-band-px",
+                    str(args.spatial_band_px),
+                    "--spatial-color-lag-ms",
+                    str(args.spatial_color_lag_ms),
+                    "--hand-height",
+                    str(max(32, args.hand_height)),
+                    "--tip-smoothing",
+                    str(min(1.0, max(0.01, args.tip_smoothing))),
+                    "--mask-report",
+                    str(mask_report),
+                    "--mask-preview",
+                    str(mask_preview),
                 ]
             )
+            run_checked(command)
         manifest[base] = {"signature": signature, "output": output.name}
         scene_outputs.append(output)
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
